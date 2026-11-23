@@ -10,6 +10,13 @@ final class NinebotOutput {
     static let fps = 30
     static let sevenInchFormat = (width: 1024, height: 600, fps: 25)
     static let fourThreeFormat = (width: 480, height: 272, fps: 10)
+    /// 5-inch safe-area insets in canvas pixels (848×480 canvas). The stock
+    /// dashboard overlays its own status strip on top and a vehicle-info card
+    /// (speed / range / battery) on the right; keeping CarPlay content inside
+    /// this inset area lets those overlays sit on black instead of covering
+    /// CarPlay content. Tuned from reference photos of the 5-inch dashboard;
+    /// adjust here if the stock overlay layout changes with a firmware update.
+    static let fiveInchContentInsets = (top: 56, left: 0, bottom: 20, right: 212)
 
     enum Mode {
         case fiveInch, sevenInch, fourThreeInch
@@ -108,7 +115,7 @@ final class NinebotOutput {
                 switch mode {
                 case .fourThreeInch: onLog("九号 4.3 寸：JPEG/RTP UDP 5012 · RTCP UDP 5013 · 480×272 · 最高 10 FPS")
                 case .sevenInch: onLog("九号 7 寸：KCP/UDP 5012 · RTCP/UDP 5013 · 1024×600 · H.264 Baseline 3.1 · 25 FPS")
-                case .fiveInch: onLog("九号 5 寸：UDP 5012/5013 · 848×480 · H.264 Baseline · 30 FPS")
+                case .fiveInch: onLog("九号 5 寸：UDP 5012/5013 · 848×480 · H.264 Baseline · 30 FPS · 安全区布局（顶部/右侧预留原车信息区）")
                 }
                 let timer = DispatchSource.makeTimerSource(queue: queue)
                 timer.schedule(deadline: .now(), repeating: .milliseconds(sevenInch ? 10 : usesJPEG ? 20 : 33), leeway: .milliseconds(3))
@@ -343,23 +350,37 @@ final class NinebotOutput {
         private func fittedImage(_ image: CVPixelBuffer) throws -> CVPixelBuffer {
             let width = sevenInch ? NinebotOutput.sevenInchFormat.width : NinebotOutput.width
             let height = sevenInch ? NinebotOutput.sevenInchFormat.height : NinebotOutput.height
-            if CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height { return image }
+            // The 5-inch safe-area layout must run even for frames that already
+            // match the canvas size, so the early return only applies elsewhere.
+            if mode != .fiveInch, CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height { return image }
             var buffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
                                              [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
             guard status == kCVReturnSuccess, let buffer else { throw ConfigurationError("无法分配九号缩放画面（\(status)）") }
             let bounds = CGRect(x: 0, y: 0, width: width, height: height)
-            compositor.render(fittedCanvas(image, in: bounds), to: buffer, bounds: bounds, colorSpace: CGColorSpaceCreateDeviceRGB())
+            var content: CGRect? = nil
+            if mode == .fiveInch {
+                let insets = NinebotOutput.fiveInchContentInsets
+                // CIImage coordinates start at the bottom-left: the top inset
+                // shrinks the area from above via its height, the bottom
+                // inset shifts its origin up.
+                content = CGRect(x: bounds.minX + CGFloat(insets.left),
+                                 y: bounds.minY + CGFloat(insets.bottom),
+                                 width: bounds.width - CGFloat(insets.left + insets.right),
+                                 height: bounds.height - CGFloat(insets.top + insets.bottom))
+            }
+            compositor.render(fittedCanvas(image, in: bounds, content: content), to: buffer, bounds: bounds, colorSpace: CGColorSpaceCreateDeviceRGB())
             return buffer
         }
 
-        private func fittedCanvas(_ image: CVPixelBuffer, in bounds: CGRect) -> CIImage {
+        private func fittedCanvas(_ image: CVPixelBuffer, in bounds: CGRect, content: CGRect? = nil) -> CIImage {
+            let area = content ?? bounds
             let source = CIImage(cvPixelBuffer: image)
-            let scale = min(bounds.width / source.extent.width, bounds.height / source.extent.height)
+            let scale = min(area.width / source.extent.width, area.height / source.extent.height)
             let scaled = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             let positioned = scaled.transformed(by: CGAffineTransform(
-                translationX: (bounds.width - scaled.extent.width) / 2,
-                y: (bounds.height - scaled.extent.height) / 2))
+                translationX: area.minX + (area.width - scaled.extent.width) / 2,
+                y: area.minY + (area.height - scaled.extent.height) / 2))
             return positioned.composited(over: CIImage(color: .black)).cropped(to: bounds)
         }
 
